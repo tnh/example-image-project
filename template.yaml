@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  image-project
+
+Globals: 
+  Function:
+    Timeout: 5
+    MemorySize: 128
+    Runtime: python3.10
+
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+  Api:
+    Auth:
+      DefaultAuthorizer: CognitoAuthorizer
+      Authorizers:
+        CognitoAuthorizer:
+          UserPoolArn: !GetAtt UserPool.Arn
+    AccessLogSetting:
+      DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+      Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod", "resourcePath":"$context.resourcePath", "status":"$context.status", "protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+    TracingEnabled: true
+    MethodSettings:
+      - LoggingLevel: INFO
+        MetricsEnabled: true
+        ResourcePath: '/*'
+        HttpMethod: '*'
+Resources:
+  ApiGatewayCloudWatchLogsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ApiGatewayLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutLogEvents'
+                  - 'logs:GetLogEvents'
+                  - 'logs:FilterLogEvents'
+                Resource: '*'
+
+  ApiGatewayAccountConfig:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-api-access-logs
+      RetentionInDays: 7  # Adjust retention period as needed
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-UserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-UserPoolClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  ImageUploadTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-image-upload-table
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: object_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: object_name
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  UrlShortenerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-url-shortener-table
+      AttributeDefinitions:
+        - AttributeName: short_id
+          AttributeType: S
+        - AttributeName: original_url
+          AttributeType: S
+      KeySchema:
+        - AttributeName: short_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OriginalUrlIndex
+          KeySchema:
+            - AttributeName: original_url
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiration_time
+        Enabled: true
+  AuthFunction:
+    Type: AWS::Serverless::Function   
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: image_app
+      Description: Image function
+      Architectures:
+      - arm64
+      Tracing: Active
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: AllAtOnce
+        Alarms:    
+          - !Ref AliasErrorMetricGreaterThanZeroAlarm
+          - !Ref LatestVersionErrorMetricGreaterThanZeroAlarm
+      Events:
+        Login:
+          Type: Api         
+          Properties:
+            Path: /login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        List:
+          Type: Api
+          Properties:
+            Path: /list
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        Upload: 
+          Type: Api
+          Properties:
+            Path: /upload/{proxy+}
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        Shorten:
+          Type: Api
+          Properties:
+            Path: /shorten/{proxy+}
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        Redirect:
+          Type: Api
+          Properties:
+            Path: /r/{proxy+}
+            Method: GET
+            Auth:
+              Authorizer: NONE
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Sub ${AWS::StackName}-upload-bucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ImageUploadTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlShortenerTable
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: ImageProject
+          POWERTOOLS_METRICS_NAMESPACE: ImageProject
+          LOG_LEVEL: INFO
+          BUCKET_NAME: !Sub ${AWS::StackName}-upload-bucket
+          IMAGE_TABLE_NAME: !Ref ImageUploadTable
+          SHORTENER_TABLE_NAME: !Ref UrlShortenerTable
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          RESIZE_WIDTH: 300
+          RESIZE_HEIGHT: 300
+          PRESIGNED_URL_TIMEOUT: 300
+          COGNITO_DOMAIN: "https://auth.ap-southeast-2.amazoncognito.com"
+      Tags:
+        LambdaPowertools: python
+
+  #AuthFunctionS3Permission:
+  #  Type: AWS::Lambda::Permission
+  #  Properties:
+ #     FunctionName: !Ref AuthFunction.Alias
+ #     Action: lambda:InvokeFunction
+ #     Principal: s3.amazonaws.com
+ #     SourceAccount: !Ref AWS::AccountId
+ #     SourceArn: !GetAtt UploadBucket.Arn
+    
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-upload-bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+ #     NotificationConfiguration:
+ #       LambdaConfigurations:
+ #         - Event: s3:ObjectCreated:*
+ #           Function: !GetAtt AuthFunction.Arn
+      IntelligentTieringConfigurations:
+        - Id: EntireBucket
+          Status: Enabled
+          Tierings:
+            - AccessTier: ARCHIVE_ACCESS
+              Days: 90
+            - AccessTier: DEEP_ARCHIVE_ACCESS
+              Days: 180
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUpload
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  AliasErrorMetricGreaterThanZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda Function Error > 0
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${AuthFunction}:live"
+        - Name: FunctionName
+          Value: !Ref AuthFunction
+
+  LatestVersionErrorMetricGreaterThanZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda Function Latest Version Error > 0
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+      Dimensions:
+        - Name: Resource
+          Value: !Ref AuthFunction
+        - Name: FunctionName
+          Value: !Ref AuthFunction
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name:
+        Fn::Sub: ApplicationInsights-SAM-${AWS::StackName}
+      ResourceQuery:
+        Type: CLOUDFORMATION_STACK_1_0
+  ApplicationInsightsMonitoring:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName:
+        Ref: ApplicationResourceGroup
+      AutoConfigurationEnabled: 'true'
+
