@@ -1,4 +1,12 @@
 # image-project
 
+Simple image API using 
 
-example project
+* api gateway
+* S3 
+* Dymamodb
+
+
+## System design
+
+[<img src="img/img.jpg">]
